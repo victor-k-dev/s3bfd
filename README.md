@@ -35,15 +35,15 @@ Start the virtual environment, then:
 
 #### Options
 ```
--t, --threads			Number of threads to use
--p, --process-type		"cache_only": create a local cache of the 
-					bucket's file and directory metadata
-				"cache_download": create a local cache and 
-					then download the files in the bucket
-				"cache_download_validate": all of the above 
-					along with validating file checksums
--D, --data-dir			Specify the parent directory for s3bfd, 
-				defaulting to ~/.s3bfd
+-t, --threads				Number of threads to use
+-p, --process-type			"cache_only": create a local cache of the 
+							bucket's file and directory metadata
+							"cache_download": create a local cache and 
+							then download the files in the bucket
+							"cache_download_validate": all of the above 
+							along with validating file checksums
+-D, --data-dir				Specify the parent directory for s3bfd, 
+							defaulting to ~/.s3bfd
 -L, --log-dir			
 -B, --database-dir
 -P, --prefix-cache-dir
