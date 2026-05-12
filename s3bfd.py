@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import heapq
 import pickle
+import random
 import requests
 import traceback
 import threading
@@ -20,6 +21,7 @@ from time import sleep
 from typing import Any, Optional
 from tqdm import tqdm
 
+# Constants
 DATABASE_NAME = "s3bfd_cache.db"
 PREFIX_CACHE_NAME = "s3bfd_prefix_cache.pkl"
 BUCKET_INFO_TABLE_NAME = "bucket_info"
@@ -36,13 +38,32 @@ DEFAULT_DATABASE_DIRECTORY = f"{DEFAULT_DATA_DIRECTORY}/database"
 DEFAULT_PREFIX_CACHE_DIRECTORY = f"{DEFAULT_DATA_DIRECTORY}/prefix_cache"
 DEFAULT_BUFFER_DIRECTORY = f"{DEFAULT_DATA_DIRECTORY}/buffer"
 DEFAULT_DOWNLOAD_DIRECTORY = f"{DEFAULT_DATA_DIRECTORY}/downloads"
+USER_AGENTS = (
+	"Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0",
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:150.0) Gecko/20100101 Firefox/150.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+
+)
 
 # Globals
 request_semaphore = threading.Semaphore(1024)
 files_semaphore = threading.Semaphore(1024)
 validation_semaphore = threading.Semaphore(64)
-s3bfd_prefix_cache = {} # { "dir_path": {"id": ..., "tree_id": ..., "tree_name": ..., "parent_id": ..., "name": ..., "path": ..., "is_directory": ...,}, ...}
+writing_to_database_semaphore = threading.Semaphore(1)
+get_current_node_id_semaphore = threading.Semaphore(1)
+# TODO: key should be f"{tree_id}-{dir_path}" to avoid collisions
+s3bfd_prefix_cache = {} # {[bucket_url]: {[path]: {"id": ..., "tree_id": ..., "tree_name": ..., "parent_id": ..., "name": ..., "path": ..., "is_directory": ...,}, ...} }
+current_node_id = 0
 global_is_debug_enabled = False
+is_s3_connection_successful = False
+base_url = ""
+
+def get_current_node_id() -> int:
+	return current_node_id
+
 
 @dataclass(order=True)
 class PrioritizedItem:
@@ -88,8 +109,7 @@ class QueueManager(BaseManager):
 QueueManager.register('LifoQueue', LifoQueue)
 QueueManager.register('FifoQueue', Queue)
 
-is_s3_connection_successful = False
-base_url = ""
+
 
 def get_s3_metadata(bucket_url, prefix="", region=None, sep=".", max_pages=None) -> tuple[list[dict],list[dict]]:
 
@@ -102,7 +122,7 @@ def get_s3_metadata(bucket_url, prefix="", region=None, sep=".", max_pages=None)
 		pass
 	
 	headers = {
-		'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0',
+		'User-Agent': USER_AGENTS[random.randint(0,len(USER_AGENTS)-1)],
 		'Accept': '*/*',
 		'Origin': f'{bucket_url}',
 		'Referer': f'{bucket_url}',
@@ -251,13 +271,15 @@ def store_bucket_metadata(task_args:tuple) -> None|list[list[dict],list[dict]]:
 	#logger.debug("(store_bucket_metadata) starting")
 	records, record_type, bucket_url, engine, current_tree_id = task_args
 	is_parent_found = False
+	global current_node_id
 	#logger.debug(f"(store_bucket_metadata) received {type(records)} containing {records}")
 	if record_type == "files" and records:
+		writing_to_database_semaphore.acquire()
 		#logger.debug("(store_bucket_metadata) received files")
 
 		path = str(Path(records[0]['Key']).parent) + "/"
 		logger.debug(f"(store_bucket_metadata) looking for node with path '{path}'")
-		if path in s3bfd_prefix_cache:
+		if path in s3bfd_prefix_cache[bucket_url]:
 			is_parent_found = True
 		else:
 			logger.warning(f"(store_bucket_metadata) node with path '{path}' does not exist in the directory cache")
@@ -272,9 +294,10 @@ def store_bucket_metadata(task_args:tuple) -> None|list[list[dict],list[dict]]:
 						last_modified = datetime.fromisoformat(file['LastModified'])
 						new_records.append(
 							BucketInfo(
+								id=current_node_id,
 								tree_id=current_tree_id,
 								tree_name=bucket_url,
-								parent_id=s3bfd_prefix_cache[path]["parent_id"],
+								parent_id=s3bfd_prefix_cache[bucket_url][path]["id"],
 								name=file_name,
 								path=file['Key'],
 								size_bytes=int(file['Size']),
@@ -282,6 +305,7 @@ def store_bucket_metadata(task_args:tuple) -> None|list[list[dict],list[dict]]:
 								original_checksum=file['ETag']
 							)
 						)
+						current_node_id += 1
 						#logger.debug(f"(store_metadata) new file records: {new_records}")
 					session.add_all(new_records)
 					session.commit()
@@ -289,10 +313,10 @@ def store_bucket_metadata(task_args:tuple) -> None|list[list[dict],list[dict]]:
 				logger.error("(store_bucket_metadata) Error when writing file metadata:\n", exc_info=True)
 	if record_type == "dirs" and records:
 		#logger.debug(f"(store_bucket_metadata) received dirs:\n{records}")
-
+		writing_to_database_semaphore.acquire()
 		path = str(Path(records[0]['Key']).parent) + "/"
 		logger.debug(f"(store_bucket_metadata) looking for node with path '{path}'")
-		if path in s3bfd_prefix_cache:
+		if path in s3bfd_prefix_cache[bucket_url]:
 			is_parent_found = True
 		else:
 			logger.warning(f"(store_bucket_metadata) node with path '{path}' does not exist in the directory cache")
@@ -306,14 +330,24 @@ def store_bucket_metadata(task_args:tuple) -> None|list[list[dict],list[dict]]:
 						dir_name = Path(dir['Key']).name
 						new_records.append(
 							BucketInfo(
+								id=current_node_id,
 								tree_id=current_tree_id,
 								tree_name=bucket_url,
-								parent_id=s3bfd_prefix_cache[path]["parent_id"],
+								parent_id=s3bfd_prefix_cache[bucket_url][path]["id"],
 								name=dir_name,
 								path=dir['Key'],
 								is_directory=True,
 							)
 						)
+						s3bfd_prefix_cache[bucket_url][dir['Key']] = {
+																					"id": current_node_id, 
+																					"tree_id": current_tree_id, 
+																					"tree_name": bucket_url, 
+																					"parent_id": s3bfd_prefix_cache[bucket_url][path]["id"],
+																					"name": dir_name,
+																					"path": dir['Key']
+																				}
+						current_node_id += 1
 					#logger.debug("(store_metadata) new dir records:\n")
 					#for nr in new_records:
 					#	logger.debug(f"{nr.path}\n")
@@ -322,27 +356,31 @@ def store_bucket_metadata(task_args:tuple) -> None|list[list[dict],list[dict]]:
 			except Exception:
 				logger.error("(store_bucket_metadata) Error when writing directory metadata to database:\n", exc_info=True)
 
-			try:
-				for dir in records:
-					dir_parent_path = str(Path(dir['Key']).parent) + "/"
-					dir_parent_id = s3bfd_prefix_cache[dir_parent_path]["parent_id"]
-					s3bfd_prefix_cache[dir['Key']] = {"tree_id": current_tree_id, "tree_name": bucket_url, "parent_id": dir_parent_id, "name": Path(dir['Key']).name}
+			#try:
+			#	for dir in records:
+			#		dir_parent_path = str(Path(dir['Key']).parent) + "/"
+			#		dir_parent_id = s3bfd_prefix_cache[dir_parent_path]["parent_id"]
+			#		s3bfd_prefix_cache[dir['Key']] = {"tree_id": current_tree_id, "tree_name": bucket_url, "parent_id": dir_parent_id, "name": Path(dir['Key']).name}
 
 			except Exception:
 				logger.error("(store_bucket_metadata) Error when writing directory metadata to prefix cache:\n", exc_info=True)
 
 	if not is_parent_found:
 		logger.warning(f"(store_bucket_metadata) unable to store {record_type}; couldn't find parent node, or another error occurred")
+		writing_to_database_semaphore.release()
 		return records
 
 	else:
+		writing_to_database_semaphore.release()
 		return None
 
 def get_bucket_metadata(task_args:tuple[str, str, str, Any, int, LifoQueue, Queue, str]) -> bool:
 	bucket_url, prefix, prefix_root, region, engine, max_workers, out_queue, pbar_queue, buffer_directory = task_args
 
+	global current_node_id
 	current_tree_id = None
 	current_root = None
+
 
 	logger.info("(get_bucket_metadata) starting")
 
@@ -371,9 +409,12 @@ def get_bucket_metadata(task_args:tuple[str, str, str, Any, int, LifoQueue, Queu
 					bucket_id=new_max_bucket_id
 				)
 				session.add(new_unique_bucket)
+				session.commit()
+
 				logger.debug(f"new unique bucket: {new_unique_bucket}")
 				if prefix_root:
 					logger.debug(f"prefix_root exists: {prefix_root}")
+					s3bfd_prefix_cache[bucket_url] = {}
 					
 					is_root_node = True
 					previous_node = None
@@ -383,8 +424,9 @@ def get_bucket_metadata(task_args:tuple[str, str, str, Any, int, LifoQueue, Queu
 						if not part:
 							continue
 						if is_root_node:
-							s3bfd_prefix_cache[prefix_root] = {"tree_id": current_tree_id, "tree_name": bucket_url, "parent_id": None, "name": part, "path": prefix_root}
+							
 							node = BucketInfo(
+								id=current_node_id,
 								tree_id=current_tree_id,
 								tree_name=bucket_url,
 								parent_id=None,
@@ -393,13 +435,16 @@ def get_bucket_metadata(task_args:tuple[str, str, str, Any, int, LifoQueue, Queu
 								is_directory=True
 							)
 							is_root_node = False
+							s3bfd_prefix_cache[bucket_url][prefix_root] = { "id": current_node_id, "tree_id": current_tree_id, "tree_name": bucket_url, "parent_id": None, "name": part, "path": prefix_root}
+							current_node_id += 1
 							previous_node = deepcopy(node)
 							logger.info(f"(get_bucket_metadata) previous node: {previous_node}")
 							new_records.append(node)
 						else:
 							logger.info(f"(get_bucket_metadata) previous node: {previous_node}")
-							s3bfd_prefix_cache[f"{previous_node.path}{part}/"] = {"tree_id": current_tree_id, "tree_name": bucket_url, "parent_id": previous_node.id, "name": part, "path": f"{previous_node.path}{part}/"}
+
 							node = BucketInfo(
+								id=current_node_id,
 								tree_id=current_tree_id,
 								tree_name=bucket_url,
 								parent_id=previous_node.id,
@@ -407,6 +452,9 @@ def get_bucket_metadata(task_args:tuple[str, str, str, Any, int, LifoQueue, Queu
 								path=f"{previous_node.path}{part}/",
 								is_directory=True,
 							)
+							
+							s3bfd_prefix_cache[bucket_url][f"{previous_node.path}{part}/"] = {"id": current_node_id, "tree_id": current_tree_id, "tree_name": bucket_url, "parent_id": previous_node.id, "name": part, "path": f"{previous_node.path}{part}/"}
+							current_node_id += 1
 							previous_node = deepcopy(node)
 							new_records.append(node)
 					session.add_all(new_records)
@@ -543,7 +591,6 @@ def get_bucket_metadata(task_args:tuple[str, str, str, Any, int, LifoQueue, Queu
 						logger.warning("not handling failed dir storage tasks")
 						logger.debug(storage_result)
 						sleep(1)
-							
 				logger.info("(get_bucket_metadata) finished storing dir metadata")
 
 				if (not internal_requests_buffer):
@@ -628,6 +675,7 @@ def get_bucket_metadata(task_args:tuple[str, str, str, Any, int, LifoQueue, Queu
 	except Exception:
 		logger.error("(get_bucket_data) Error occurred while requesting/storing bucket metadata:\n", exc_info=True)
 		return False
+	return True
 
 def file_storage_thread(task_args:tuple[int, Any, LifoQueue]) -> bool:
 	max_workers, engine, in_queue = task_args
@@ -814,7 +862,8 @@ def validate_bucket_files(task_args:tuple[int, Any, Queue]):
 	return True
 
 def run_s3bfd(task_args:dict[str, Any]|None=None):
-		
+
+	random.seed()
 	is_started_from_gui = False
 	
 	bucket_url = None
