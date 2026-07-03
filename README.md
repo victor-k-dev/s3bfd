@@ -2,16 +2,19 @@
 
 An application for downloading files from S3 buckets.
 
-Note: s3bfd is currently under active development.
+## Notes
+
+- This project has been re-licensed under the Mozilla Public License v2.0 as of 2026/07/03
 
 ## Compatibility
 
 - Linux
-- macOS (probably, as it's POSIX certified)
-
-Windows compatibility is in the works. 
+- macOS (assumed, but untested)
+- Windows (assumed, but untested)
 
 ## Installation
+
+(Installation instructions are currently out-of-date)
 
 1. Install a supported Python version
 2. Create a virtual environment
@@ -19,6 +22,8 @@ Windows compatibility is in the works.
 4. Download and place the `s3bfd.py`, `s3bfd_gui.py` and `utils.py` scripts into the same folder
 
 ## Usage
+
+(Usage instructions are currently out-of-date)
 
 ### GUI
 
@@ -34,6 +39,9 @@ Start the virtual environment, then:
 `python3 s3bfd.py [BUCKET_URL] [PREFIX] [REGION] [OPTIONS]`
 
 #### Options
+
+(List of options is currently out-of-date)
+
 ```
 -t, --threads				Number of threads to use
 -p, --process-type			"cache_only": create a local cache of the 
